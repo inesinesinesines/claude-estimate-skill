@@ -176,6 +176,49 @@ Lab03 실측에서 스킬이 이미 존재하여 예측 대비 77% 빠르게 완
 언어 계수:    영어=1.0, 한국어=1.3, 혼합=1.15
 ```
 
+## Step 0: 캘리브레이션 데이터 확인
+
+예측 전에 **반드시** 실측 캘리브레이션 데이터를 먼저 확인한다:
+
+```bash
+bash ~/.claude/scripts/calibrate.sh  # calibration.json 생성/갱신
+cat ~/.claude/timing/calibration.json
+```
+
+### calibration.json 구조
+
+```json
+{
+  "calibration_version": 1,
+  "sample_count": { "tools": 847, "responses": 42 },
+  "tool_avg": {
+    "Read": { "avg_ms": 480, "min_ms": 200, "max_ms": 1200, "count": 150 },
+    "Bash": { "avg_ms": 2300, ... },
+    ...
+  },
+  "gap": {
+    "same_tool": { "avg_ms": 5200, "count": 80 },
+    "diff_tool": { "avg_ms": 6800, "count": 120 },
+    "overall":   { "avg_ms": 6100, "count": 200 }
+  },
+  "gap_histogram": { "0-1s": 12, "1-3s": 45, "3-5s": 30, ... },
+  "response_avg": { "avg_duration_ms": 45000, "avg_tools_per_response": 5.2 }
+}
+```
+
+### 실측값 우선 원칙
+
+| 항목 | calibration.json 있을 때 | 없을 때 |
+|------|------------------------|---------|
+| 도구 실행 시간 | `tool_avg.{도구}.avg_ms` 사용 | 아래 기본값 사용 |
+| 판단 시간 (gap) | `gap.same_tool.avg_ms` / `gap.diff_tool.avg_ms` 사용 | v5 분류표 기본값 사용 |
+| 응답당 시간 | `response_avg.avg_duration_ms` 참고 | 계산으로 추정 |
+
+**sample_count.tools가 20 미만이면** 기본값과 실측값을 가중평균한다:
+```
+혼합값 = 기본값 × (1 - n/20) + 실측값 × (n/20)    (n = sample count)
+```
+
 ## Step 1: 타이밍 데이터 읽기
 
 ```bash
@@ -198,9 +241,10 @@ timestamp_ms|type|name|duration_ms
 ### 2-1. 작업 분석
 
 작업을 분석하여:
-1. **생성할 출력물** 식별 — HTML? 코드? 설정 파일? 몇 개?
-2. **필요한 도구 호출** 예상 — Read, Grep, Bash, WebSearch 등 각 몇 회?
-3. **현재 환경** 확인 — 모델, 대화 길이, 시간대
+1. **캘리브레이션 데이터 로드** — calibration.json이 있으면 실측값 우선
+2. **생성할 출력물** 식별 — HTML? 코드? 설정 파일? 몇 개?
+3. **필요한 도구 호출** 예상 — Read, Grep, Bash, WebSearch 등 각 몇 회?
+4. **현재 환경** 확인 — 모델, 대화 길이, 시간대
 
 ### 2-2. 예측 계산
 
@@ -209,7 +253,7 @@ timestamp_ms|type|name|duration_ms
    각 출력물의 (예상 글자 수 × 글자당 속도) 합산
 
 ② 도구 실행 시간:
-   각 도구의 (평균 시간 × 호출 수) 합산
+   calibration.json의 tool_avg가 있으면 실측값 사용, 없으면 아래 기본값:
    - Read: ~0.5초, Write: ~0.4초, Edit: ~0.4초
    - Bash: ~1~5초 (명령에 따라 가변)
    - Grep/Glob: ~1초
@@ -217,7 +261,10 @@ timestamp_ms|type|name|duration_ms
    - Agent: ~30~60초
 
 ③ 도구 간 판단 시간:
-   도구 호출 시퀀스를 나열하고, 각 전환별 판단 시간 차등 적용 (v5 판단 시간 분류표 참조)
+   calibration.json의 gap 데이터가 있으면 실측값 사용:
+   - same_tool.avg_ms → 같은 도구 연속 시 gap
+   - diff_tool.avg_ms → 다른 도구 전환 시 gap
+   실측값이 없으면 v5 분류표 기본값 적용:
    - 단순 반복: 1~2초, 분석성 연속: 8~12초, 병렬: 0초, 전환: 5~7초, 복잡판단: 12~15초
    - "→Write 직전"의 대형 출력 생성은 ①의 출력물 생성 시간으로 별도 계산
 
@@ -262,8 +309,8 @@ timestamp_ms|type|name|duration_ms
 | **최종 예측** | **~3분 27초** |
 
 > 📊 데이터 N회 기반 | 신뢰 구간: ±30%
+> 데이터 소스: calibration.json (실측 847회) 또는 기본값
 > 환경: Opus 4.6, 한국어, 대화 초반
-> v4 보정: 판단 시간 차등, 사전 작업물 확인, 1M 컨텍스트 기준
 ```
 
 ## Step 3: 통계 요약 (작업 설명이 없는 경우)
@@ -274,6 +321,41 @@ timestamp_ms|type|name|duration_ms
 - 50초 이상 사고 구간 상세 (병목 지점)
 - 출력물 크기 vs 사고 시간 상관관계 (Write된 파일이 있으면)
 - 실측 Lab 데이터 (있으면)
+
+## 인라인 예측 모드 (CLAUDE.md 연동)
+
+`/estimate`로 명시적 호출하는 것 외에, CLAUDE.md에 아래 지침을 추가하면 **모든 응답의 첫 줄에** 예상 시간을 자동 표시할 수 있습니다.
+
+### CLAUDE.md 권장 설정
+
+```markdown
+## 작업 시간 예측 자동 표시
+
+**모든 응답의 첫 줄에** 예상 소요 시간을 표시하세요. 구현 작업뿐 아니라 질의응답, 탐색, 설명 등 모든 유형의 요청에 적용합니다. TaskCreate/TaskUpdate 사용 여부와 무관하게 항상 표시합니다.
+
+estimate 스킬(v5)의 공식을 적용합니다:
+
+1. 생성할 출력물의 예상 크기(글자 수)와 유형을 파악
+2. 필요한 도구 호출 시퀀스를 나열
+3. 판단 시간 분류표(v5)에 따라 각 전환별 시간 차등 적용:
+   - 단순 반복: 1~2초 / 분석성 연속: 8~12초 / 병렬: 0초 / 전환: 5~7초 / 복잡판단: 12~15초
+4. 사전 작업물 존재 여부 확인 후 할인 적용
+5. 환경 보정 적용 (모델 계수 x 컨텍스트 계수 x 언어 계수)
+
+표시 형식 (간결하게 한 줄):
+\`\`\`
+> 예상: ~N분 M초 (출력물 Xs + 도구 Ys + 판단 Zs | 보정: 모델×컨텍스트×언어)
+\`\`\`
+```
+
+### 인라인 vs 상세 모드 구분
+
+| 모드 | 트리거 | 출력 형식 |
+|------|--------|----------|
+| **인라인** | CLAUDE.md에 의한 자동 표시 (모든 응답) | 한 줄: `> 예상: ~N분 M초 (...)` |
+| **상세** | `/estimate` 명시적 호출 | 전체 테이블 (출력물, 도구, 판단 시간 상세) |
+
+인라인 모드에서는 동일한 v5 공식을 적용하되, 결과를 한 줄로 압축합니다. 상세 내역이 필요하면 `/estimate`를 호출하면 됩니다.
 
 ## Important Notes
 
